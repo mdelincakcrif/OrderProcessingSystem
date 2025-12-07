@@ -3,7 +3,20 @@
     "allow": [
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(dir \"C:\\Projects\\OrderProcessingSystem\" /B)",
+      "WebSearch",
+      "Bash(git pull:*)",
+      "Bash(dotnet add:*)",
+      "Bash(dotnet build:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(dotnet ef migrations add:*)",
+      "Bash(dotnet ef database update:*)",
+      "Bash(dotnet ef migrations remove:*)",
+      "Bash(dotnet run:*)",
+      "WebFetch(domain:localhost)",
+      "Bash(dotnet test:*)",
+      "Bash(dotnet script eval:*)"
     ],
     "deny": [],
     "ask": []

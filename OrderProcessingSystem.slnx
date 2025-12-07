@@ -1,3 +1,6 @@
 <Solution>
-  <Project Path="OrderProcessingSystem/WebApi.csproj" />
+  <Folder Name="/Tests/">
+    <Project Path="Tests/WebApi.Tests/WebApi.Tests.csproj" />
+  </Folder>
+  <Project Path="WebApi/WebApi.csproj" />
 </Solution>
