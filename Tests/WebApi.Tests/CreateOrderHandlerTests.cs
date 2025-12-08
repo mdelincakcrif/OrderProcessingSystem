@@ -1,5 +1,7 @@
 using FluentAssertions;
+using MassTransit;
 using Microsoft.EntityFrameworkCore;
+using NSubstitute;
 using WebApi.Orders.Domain;
 using WebApi.Orders.DTOs;
 using WebApi.Orders.Features.CreateOrder;
@@ -42,7 +44,8 @@ public class CreateOrderHandlerTests
         context.Products.Add(product);
         await context.SaveChangesAsync();
 
-        var handler = new CreateOrderHandler(context);
+        var publishEndpoint = Substitute.For<IPublishEndpoint>();
+        var handler = new CreateOrderHandler(context, publishEndpoint);
         var command = new CreateOrderCommand(
             userId,
             new List<CreateOrderItemRequest> { new CreateOrderItemRequest(productId, 2, 50.00m) }
@@ -105,7 +108,8 @@ public class CreateOrderHandlerTests
         context.Products.AddRange(product1, product2);
         await context.SaveChangesAsync();
 
-        var handler = new CreateOrderHandler(context);
+        var publishEndpoint = Substitute.For<IPublishEndpoint>();
+        var handler = new CreateOrderHandler(context, publishEndpoint);
         var command = new CreateOrderCommand(
             userId,
             new List<CreateOrderItemRequest>
@@ -146,7 +150,8 @@ public class CreateOrderHandlerTests
         context.Users.Add(user);
         await context.SaveChangesAsync();
 
-        var handler = new CreateOrderHandler(context);
+        var publishEndpoint = Substitute.For<IPublishEndpoint>();
+        var handler = new CreateOrderHandler(context, publishEndpoint);
         var nonExistentProductId = Guid.NewGuid();
         var command = new CreateOrderCommand(
             userId,

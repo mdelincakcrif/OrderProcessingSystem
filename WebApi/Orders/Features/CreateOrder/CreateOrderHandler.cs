@@ -1,18 +1,22 @@
+using MassTransit;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using WebApi.Dal;
 using WebApi.Orders.Domain;
 using WebApi.Orders.DTOs;
+using WebApi.Orders.Events;
 
 namespace WebApi.Orders.Features.CreateOrder;
 
 public class CreateOrderHandler : IRequestHandler<CreateOrderCommand, IResult>
 {
     private readonly OrderProcessingDbContext _context;
+    private readonly IPublishEndpoint _publishEndpoint;
 
-    public CreateOrderHandler(OrderProcessingDbContext context)
+    public CreateOrderHandler(OrderProcessingDbContext context, IPublishEndpoint publishEndpoint)
     {
         _context = context;
+        _publishEndpoint = publishEndpoint;
     }
 
     public async Task<IResult> Handle(CreateOrderCommand request, CancellationToken cancellationToken)
@@ -59,6 +63,14 @@ public class CreateOrderHandler : IRequestHandler<CreateOrderCommand, IResult>
 
         _context.Orders.Add(order);
         await _context.SaveChangesAsync(cancellationToken);
+
+        // Publish OrderCreatedEvent
+        await _publishEndpoint.Publish(new OrderCreatedEvent(
+            order.Id,
+            order.UserId,
+            order.Total,
+            order.CreatedAt
+        ), cancellationToken);
 
         var response = new OrderResponse(
             order.Id,

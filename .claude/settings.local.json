@@ -16,7 +16,8 @@
       "Bash(dotnet run:*)",
       "WebFetch(domain:localhost)",
       "Bash(dotnet test:*)",
-      "Bash(dotnet script eval:*)"
+      "Bash(dotnet script eval:*)",
+      "Bash(timeout 15 docker logs:*)"
     ],
     "deny": [],
     "ask": []

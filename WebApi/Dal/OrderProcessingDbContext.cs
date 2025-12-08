@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using WebApi.Users.Domain;
 using WebApi.Products.Domain;
 using WebApi.Orders.Domain;
+using WebApi.Notifications.Domain;
 
 namespace WebApi.Dal;
 
@@ -16,6 +17,7 @@ public class OrderProcessingDbContext : DbContext
     public DbSet<Product> Products => Set<Product>();
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<OrderItem> OrderItems => Set<OrderItem>();
+    public DbSet<Notification> Notifications => Set<Notification>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using FluentValidation;
+using MassTransit;
 using WebApi.Common.Behaviors;
 using WebApi.Common.Middleware;
 using WebApi.Common.Security;
@@ -12,6 +13,8 @@ using WebApi.Authentication.Endpoints;
 using WebApi.Users.Endpoints;
 using WebApi.Products.Endpoints;
 using WebApi.Orders.Endpoints;
+using WebApi.Orders.EventConsumers;
+using WebApi.Notifications.EventConsumers;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -28,6 +31,29 @@ builder.Services.AddMediatR(cfg =>
 
 // Add FluentValidation
 builder.Services.AddValidatorsFromAssembly(typeof(Program).Assembly);
+
+// Add MassTransit with RabbitMQ
+builder.Services.AddMassTransit(x =>
+{
+    // Register consumers
+    x.AddConsumer<OrderCreatedConsumer>();
+    x.AddConsumer<OrderCompletedNotificationConsumer>();
+    x.AddConsumer<OrderExpiredNotificationConsumer>();
+
+    // Configure RabbitMQ transport
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitMqSettings = builder.Configuration.GetSection("RabbitMqSettings");
+        cfg.Host(rabbitMqSettings["Host"] ?? "localhost", h =>
+        {
+            h.Username(rabbitMqSettings["Username"] ?? "guest");
+            h.Password(rabbitMqSettings["Password"] ?? "guest");
+        });
+
+        // Auto-configure receive endpoints for all consumers
+        cfg.ConfigureEndpoints(context);
+    });
+});
 
 // Add JWT Authentication
 var jwtSettings = builder.Configuration.GetSection("JwtSettings");

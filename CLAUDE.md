@@ -225,6 +225,8 @@ dotnet add WebApi/WebApi.csproj package <PackageName>
 - **Password Hashing**: BCrypt.Net-Next 4.0.3
 - **API Documentation**: Swashbuckle.AspNetCore 7.2.0
 - **Testing**: xUnit 2.9.2, FluentAssertions 6.12.2, Microsoft.AspNetCore.Mvc.Testing
+- **Message Bus**: MassTransit 8.5.2 with RabbitMQ 3
+- **Background Jobs**: BackgroundService (built-in .NET)
 
 ### Service Registration (Program.cs)
 
@@ -233,9 +235,11 @@ The application configures services in this order:
 1. **DbContext** - PostgreSQL with Npgsql provider
 2. **MediatR** - With ValidationBehavior pipeline
 3. **FluentValidation** - Auto-register validators from assembly
-4. **JWT Authentication** - Bearer token authentication
-5. **Authorization** - Role-based authorization
-6. **Swagger** - OpenAPI with JWT security scheme
+4. **MassTransit** - Event bus with RabbitMQ transport, consumer registration
+5. **Background Jobs** - OrderExpirationJob for automated order expiration
+6. **JWT Authentication** - Bearer token authentication
+7. **Authorization** - Role-based authorization
+8. **Swagger** - OpenAPI with JWT security scheme
 
 ### Middleware Pipeline (Program.cs)
 
@@ -318,3 +322,386 @@ Test pattern:
 1. Arrange: Create request objects
 2. Act: Send HTTP request via test client
 3. Assert: Verify response status and content using FluentAssertions
+
+---
+
+## Event-Driven Architecture
+
+### Overview
+
+The application uses MassTransit with RabbitMQ for event-driven communication:
+- **Events**: Immutable records representing domain events (OrderCreated, OrderCompleted, OrderExpired)
+- **Publishers**: Handlers and jobs that publish events using `IPublishEndpoint`
+- **Consumers**: Classes implementing `IConsumer<TEvent>` that react to events
+- **Transport**: RabbitMQ running in Docker for message queuing
+
+### Event Flow
+
+```
+1. User creates order via POST /api/orders
+2. Order saved to DB with status='Pending'
+3. OrderCreatedEvent published to RabbitMQ
+4. OrderCreatedConsumer handles event asynchronously:
+   - Updates status to 'Processing'
+   - Simulates payment (5 sec delay)
+   - 50% chance: Updates status to 'Completed' + publishes OrderCompletedEvent
+   - 50% chance: Remains 'Processing'
+5. OrderCompletedConsumer handles event:
+   - Logs fake email to console
+   - Saves notification to DB
+6. OrderExpirationJob runs every 60s:
+   - Finds Processing orders older than 10 minutes
+   - Updates them to 'Expired'
+   - Publishes OrderExpiredEvent for each
+7. OrderExpiredConsumer handles event:
+   - Saves notification to DB
+```
+
+### Event Messages
+
+Events are immutable records in `Orders/Events/`:
+
+```csharp
+public record OrderCreatedEvent(
+    Guid OrderId,
+    Guid UserId,
+    decimal Total,
+    DateTime CreatedAt
+);
+
+public record OrderCompletedEvent(
+    Guid OrderId,
+    Guid UserId,
+    decimal Total,
+    DateTime CompletedAt
+);
+
+public record OrderExpiredEvent(
+    Guid OrderId,
+    Guid UserId,
+    DateTime ExpiredAt
+);
+```
+
+**Key Points:**
+- Events are immutable records (matches DTO pattern)
+- Include all essential information (OrderId, UserId, timestamps)
+- Use descriptive past-tense names
+- No business logic, just data carriers
+
+### Event Publishing
+
+Publishing events after state changes:
+
+```csharp
+// In CreateOrderHandler.cs
+public class CreateOrderHandler : IRequestHandler<CreateOrderCommand, IResult>
+{
+    private readonly OrderProcessingDbContext _context;
+    private readonly IPublishEndpoint _publishEndpoint;
+
+    public async Task<IResult> Handle(CreateOrderCommand request, CancellationToken ct)
+    {
+        // ... create and save order ...
+
+        await _context.SaveChangesAsync(ct);
+
+        // Publish event AFTER database save
+        await _publishEndpoint.Publish(new OrderCreatedEvent(
+            order.Id,
+            order.UserId,
+            order.Total,
+            order.CreatedAt
+        ), ct);
+
+        return Results.Created($"/api/orders/{order.Id}", response);
+    }
+}
+```
+
+**Key Points:**
+- Inject `IPublishEndpoint` from MassTransit
+- Publish events AFTER `SaveChangesAsync` to ensure DB consistency
+- Include `cancellationToken` for proper async cancellation
+- Events are fire-and-forget (no return value)
+
+### Event Consumers
+
+Consumers implement `IConsumer<TEvent>`:
+
+```csharp
+// In Orders/EventConsumers/OrderCreatedConsumer.cs
+public class OrderCreatedConsumer : IConsumer<OrderCreatedEvent>
+{
+    private readonly OrderProcessingDbContext _context;
+    private readonly IPublishEndpoint _publishEndpoint;
+    private readonly ILogger<OrderCreatedConsumer> _logger;
+
+    public async Task Consume(ConsumeContext<OrderCreatedEvent> context)
+    {
+        var message = context.Message;
+        _logger.LogInformation("Processing order {OrderId}", message.OrderId);
+
+        var order = await _context.Orders.FindAsync(message.OrderId);
+        if (order == null) return;
+
+        order.Status = OrderStatus.Processing;
+        await _context.SaveChangesAsync();
+
+        // Simulate payment processing
+        await Task.Delay(TimeSpan.FromSeconds(5), context.CancellationToken);
+
+        // 50% success rate
+        if (new Random().Next(0, 2) == 1)
+        {
+            order.Status = OrderStatus.Completed;
+            await _context.SaveChangesAsync();
+
+            // Publish next event
+            await _publishEndpoint.Publish(new OrderCompletedEvent(
+                order.Id,
+                order.UserId,
+                order.Total,
+                order.UpdatedAt
+            ), context.CancellationToken);
+        }
+    }
+}
+```
+
+**Key Points:**
+- Consumers are registered as scoped (new instance per message)
+- Use `ConsumeContext<TEvent>` to access message and metadata
+- Inject scoped dependencies (DbContext, IPublishEndpoint, ILogger)
+- Use `context.CancellationToken` for cancellation support
+- Log all important operations for debugging
+- Handle missing data gracefully (defensive programming)
+- Can publish new events to create event chains
+
+### Background Jobs
+
+Background jobs use `BackgroundService`:
+
+```csharp
+// In Jobs/OrderExpirationJob.cs
+public class OrderExpirationJob : BackgroundService
+{
+    private readonly IServiceScopeFactory _serviceScopeFactory;
+    private readonly ILogger<OrderExpirationJob> _logger;
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await ProcessExpiredOrders(stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing expired orders");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
+        }
+    }
+
+    private async Task ProcessExpiredOrders(CancellationToken ct)
+    {
+        using var scope = _serviceScopeFactory.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<OrderProcessingDbContext>();
+        var publishEndpoint = scope.ServiceProvider.GetRequiredService<IPublishEndpoint>();
+
+        var cutoff = DateTime.UtcNow.AddMinutes(-10);
+        var expired = await context.Orders
+            .Where(o => o.Status == OrderStatus.Processing && o.UpdatedAt < cutoff)
+            .ToListAsync(ct);
+
+        foreach (var order in expired)
+        {
+            order.Status = OrderStatus.Expired;
+            await publishEndpoint.Publish(new OrderExpiredEvent(
+                order.Id, order.UserId, order.UpdatedAt
+            ), ct);
+        }
+
+        await context.SaveChangesAsync(ct);
+    }
+}
+```
+
+**Key Points:**
+- Background services are singletons, run for application lifetime
+- Use `IServiceScopeFactory` to create scopes for scoped dependencies
+- Infinite loop with periodic delay (60 seconds)
+- Wrap processing in try-catch to prevent crashes
+- Use `stoppingToken` to gracefully handle shutdown
+- Create scope per iteration to avoid memory leaks
+
+### Notifications Module
+
+The Notifications module provides an audit trail for order events:
+
+**Domain:**
+```csharp
+public enum NotificationType
+{
+    OrderCompleted,
+    OrderExpired
+}
+
+public class Notification
+{
+    public Guid Id { get; set; }
+    public Guid OrderId { get; set; }
+    public NotificationType Type { get; set; }
+    public string Message { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+**Consumer:**
+```csharp
+public class OrderCompletedNotificationConsumer : IConsumer<OrderCompletedEvent>
+{
+    public async Task Consume(ConsumeContext<OrderCompletedEvent> context)
+    {
+        var message = context.Message;
+
+        // Mock email notification (log to console)
+        _logger.LogInformation(
+            "📧 Sending email: Order {OrderId} completed. Total: ${Total}",
+            message.OrderId, message.Total);
+
+        // Save audit trail
+        var notification = new Notification
+        {
+            Id = Guid.NewGuid(),
+            OrderId = message.OrderId,
+            Type = NotificationType.OrderCompleted,
+            Message = $"Order {message.OrderId} completed. Total: ${message.Total}",
+            CreatedAt = DateTime.UtcNow
+        };
+
+        _context.Notifications.Add(notification);
+        await _context.SaveChangesAsync();
+    }
+}
+```
+
+### RabbitMQ Management
+
+**Docker Commands:**
+```bash
+# Start RabbitMQ
+docker-compose up -d rabbitmq
+
+# View logs
+docker-compose logs -f rabbitmq
+
+# Stop RabbitMQ
+docker-compose stop rabbitmq
+```
+
+**Management UI:**
+- URL: http://localhost:15672
+- Credentials: guest/guest
+- View queues, exchanges, bindings
+- Monitor message rates
+- Debug messages (view content, purge, retry)
+
+**Queues Created by MassTransit:**
+- `order-created-event` - OrderCreatedConsumer queue
+- `order-completed-event` - OrderCompletedNotificationConsumer queue
+- `order-expired-event` - OrderExpiredNotificationConsumer queue
+
+### Adding New Events
+
+When adding a new event:
+
+1. **Create Event Record** in `ModuleName/Events/`
+   ```csharp
+   public record SomethingHappenedEvent(Guid Id, DateTime OccurredAt);
+   ```
+
+2. **Publish Event** using `IPublishEndpoint`
+   ```csharp
+   await _publishEndpoint.Publish(new SomethingHappenedEvent(...), ct);
+   ```
+
+3. **Create Consumer** in `ModuleName/EventConsumers/`
+   ```csharp
+   public class SomethingHappenedConsumer : IConsumer<SomethingHappenedEvent>
+   {
+       public async Task Consume(ConsumeContext<SomethingHappenedEvent> context)
+       {
+           // Handle event
+       }
+   }
+   ```
+
+4. **Register Consumer** in `Program.cs`
+   ```csharp
+   x.AddConsumer<SomethingHappenedConsumer>();
+   ```
+
+5. **Write Tests** for publisher and consumer
+
+### Testing Event-Driven Code
+
+**Testing Consumers:**
+```csharp
+[Fact]
+public async Task Consume_ProcessesEvent()
+{
+    // Arrange
+    var context = InMemoryDbHelper.CreateDbContext();
+    var publishEndpoint = Substitute.For<IPublishEndpoint>();
+    var logger = Substitute.For<ILogger<MyConsumer>>();
+    var consumer = new MyConsumer(context, publishEndpoint, logger);
+
+    var myEvent = new MyEvent(Guid.NewGuid(), DateTime.UtcNow);
+    var consumeContext = Substitute.For<ConsumeContext<MyEvent>>();
+    consumeContext.Message.Returns(myEvent);
+    consumeContext.CancellationToken.Returns(CancellationToken.None);
+
+    // Act
+    await consumer.Consume(consumeContext);
+
+    // Assert
+    // Verify database changes
+    // Verify published events using publishEndpoint.Received()
+}
+```
+
+**Testing Event Publishing:**
+```csharp
+[Fact]
+public async Task Handle_PublishesEvent()
+{
+    // Arrange
+    var context = InMemoryDbHelper.CreateDbContext();
+    var publishEndpoint = Substitute.For<IPublishEndpoint>();
+    var handler = new MyHandler(context, publishEndpoint);
+
+    // Act
+    await handler.Handle(command, CancellationToken.None);
+
+    // Assert
+    await publishEndpoint.Received(1).Publish(
+        Arg.Is<MyEvent>(e => e.Id == expectedId),
+        Arg.Any<CancellationToken>());
+}
+```
+
+### Common Event-Driven Gotchas
+
+- **Event Order**: Events are processed asynchronously, no guaranteed order
+- **Idempotency**: Consumers may receive same event multiple times, handle gracefully
+- **Scope Issues**: Background services are singletons, use `IServiceScopeFactory`
+- **Cancellation**: Always pass `CancellationToken` for graceful shutdown
+- **Error Handling**: Use try-catch in consumers, MassTransit has retry policies
+- **Testing Randomness**: 50% success rate in OrderCreatedConsumer causes flaky tests
+  - Solution: Test for "not Pending" rather than specific status
+- **Logger Assertions**: Can't easily assert ILogger calls with NSubstitute
+  - Solution: Verify side effects (database changes) instead
